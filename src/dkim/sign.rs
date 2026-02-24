@@ -43,6 +43,36 @@ impl<T: SigningKey> DkimSigner<T, Done> {
         )
     }
 
+    /// Computes the base64-encoded body hash for a message using this signer's
+    /// canonicalization settings. Pass the result to [`sign_with_body_hash`] to
+    /// avoid recomputing the hash when signing the same message with multiple
+    /// domains or selectors.
+    pub fn compute_body_hash(&self, message: &[u8]) -> crate::Result<Vec<u8>> {
+        let (_, _, _, canonical_body) = self.template.canonicalize(HeaderIterator::new(message));
+        let body_hash = self.key.hash(canonical_body);
+        Ok(base64_encode(body_hash.as_ref())?)
+    }
+
+    /// Signs a message with a pre-computed body hash (obtained from
+    /// [`compute_body_hash`]).  When the same message body must be signed by
+    /// multiple signers (e.g. primary domain + FBL domain), computing the body
+    /// hash once and reusing it avoids a redundant SHA-256 pass over the body.
+    #[inline(always)]
+    pub fn sign_with_body_hash(
+        &self,
+        message: &[u8],
+        body_hash_b64: &[u8],
+    ) -> crate::Result<Signature> {
+        self.sign_prehashed_stream(
+            HeaderIterator::new(message),
+            body_hash_b64,
+            SystemTime::now()
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0),
+        )
+    }
+
     fn sign_stream<'x>(
         &self,
         message: impl HeaderStream<'x>,
@@ -78,6 +108,42 @@ impl<T: SigningKey> DkimSigner<T, Done> {
         })?;
 
         // Encode
+        signature.b = base64_encode(&b)?;
+
+        Ok(signature)
+    }
+
+    fn sign_prehashed_stream<'x>(
+        &self,
+        message: impl HeaderStream<'x>,
+        body_hash_b64: &[u8],
+        now: u64,
+    ) -> crate::Result<Signature> {
+        // Canonicalize headers only; body hash is already computed.
+        let (body_len, canonical_headers, signed_headers, _canonical_body) =
+            self.template.canonicalize(message);
+
+        if signed_headers.is_empty() {
+            return Err(Error::NoHeadersFound);
+        }
+
+        let mut signature = self.template.clone();
+        signature.bh = body_hash_b64.to_vec();
+        signature.t = now;
+        signature.x = if signature.x > 0 {
+            now + signature.x
+        } else {
+            0
+        };
+        signature.h = signed_headers;
+        if signature.l > 0 {
+            signature.l = body_len as u64;
+        }
+
+        let b = self.key.sign(SignableMessage {
+            headers: canonical_headers,
+            signature: &signature,
+        })?;
         signature.b = base64_encode(&b)?;
 
         Ok(signature)
